@@ -26,6 +26,15 @@ const bool useOfflineSpeech = true;
 /// another English one, or the phone's own language.
 const String preferredSpeechLocale = 'en_US';
 
+/// FAST RESPONSE: true = "forward" / "backward" are sent the moment the
+/// phone hears the word, so the car starts right away. If more words
+/// follow in the same sentence ("forward LEFT", "forward 5 SECONDS"), the
+/// longer command is sent a moment later and replaces it.
+/// false = wait [driveSettle] for more words first (the old way: the car
+/// starts up to 0.8 s later, but never does the short "forward" first).
+const bool sendDriveAtOnce = true;
+const Duration driveSettle = Duration(milliseconds: 800);
+
 /// How often the app tells the car "I'm still here". The car stops by
 /// itself if it hears nothing for 600 ms (see FAILSAFE_MS in the sketch).
 const Duration heartbeatEvery = Duration(milliseconds: 150);
@@ -65,11 +74,12 @@ const Map<String, String> soundAlikes = {
   // right
   'write': 'right', 'rite': 'right', 'ride': 'right', 'wright': 'right',
   'rights': 'right', 'riot': 'right', 'righ': 'right', 'bright': 'right',
-  // hard
-  'heart': 'hard', 'hart': 'hard', 'harder': 'hard', 'hearts': 'hard',
-  'heard': 'hard', 'hardly': 'hard', 'had': 'hard',
   // five
   '5': 'five', '5s': 'five', 'fife': 'five', 'fives': 'five',
+  // drift
+  'drifts': 'drift', 'drifting': 'drift', 'drifted': 'drift', 'rift': 'drift',
+  'drip': 'drift', 'thrift': 'drift', 'spin': 'drift', 'spinning': 'drift',
+  'rotate': 'drift', 'swing': 'drift',
   // off
   'of': 'off', 'auf': 'off', 'offf': 'off',
 };
@@ -100,7 +110,6 @@ const List<String> commandWords = [
   'backward',
   'left',
   'right',
-  'hard',
   'five',
   'engine',
   'turn',
@@ -110,6 +119,7 @@ const List<String> commandWords = [
   'switch',
   'shutdown',
   'seconds',
+  'drift',
 ];
 
 int _editDistance(String a, String b) {
@@ -162,12 +172,13 @@ List<String> normalizeHeardWords(String sentence) {
 ///   "turn off" / "engine off" / "shut down"    -> OFF
 ///   "stop"                                     -> STOP
 ///   "5 seconds forward" / "5s forward"         -> FWD5
-///   "forward"                                  -> FWD   (until stop)
+///   "forward"                                  -> FWD   (short 1 s move)
 ///   "5 seconds backward"                       -> BACK5
-///   "backward"                                 -> BACK  (until stop)
-///   "forward left" / "forward right"           -> FWD_LEFT / FWD_RIGHT (3 s)
-///   "backward left" / "backward right"         -> BACK_LEFT / BACK_RIGHT (3 s)
-///   "hard left forward" / "hard right forward" -> HARD_LEFT / HARD_RIGHT (circle)
+///   "backward"                                 -> BACK  (short 1 s move)
+///   "forward left" / "forward right"           -> FWD_LEFT / FWD_RIGHT (1 s)
+///   "backward left" / "backward right"         -> BACK_LEFT / BACK_RIGHT (1 s)
+///   "drift left" / "turn left" / "spin left"   -> DRIFT_LEFT  (nose to the left)
+///   "drift right" / "turn right"               -> DRIFT_RIGHT (nose to the right)
 String? parseVoiceCommand(String sentence) {
   final list = normalizeHeardWords(sentence);
   final text = list.join(' ');
@@ -199,12 +210,15 @@ String? parseVoiceCommand(String sentence) {
   final backward = has(['backward', 'backwards', 'back', 'reverse']);
   final left = has(['left', 'lift', 'laughed']);
   final right = has(['right', 'write', 'rite', 'ride']);
-  final hard = has(['hard', 'heart', 'hart', 'harder']);
   final five = has(['5', '5s', 'five', 'fives']);
   if (left && right) return null; // can't be both, ask again
 
-  if (hard && !backward && left) return 'HARD_LEFT';
-  if (hard && !backward && right) return 'HARD_RIGHT';
+  // "drift left" / "turn left": turn the nose on the spot.
+  if ((has(['drift']) || phrase(['turn left', 'turn right'])) &&
+      (left || right)) {
+    return left ? 'DRIFT_LEFT' : 'DRIFT_RIGHT';
+  }
+
   if (forward && !backward) {
     if (left) return 'FWD_LEFT';
     if (right) return 'FWD_RIGHT';
@@ -227,7 +241,7 @@ String? pickCommand(List<String> guesses) {
   if (commands.contains('STOP')) return 'STOP';
   final best = commands.firstWhere((c) => c != null, orElse: () => null);
   // A plain "forward"/"backward" may have lost a word in the noise
-  // ("hard laugh forward"). If another guess has the longer command in the
+  // ("forward laugh"). If another guess has the longer command in the
   // same direction, use that one.
   if (best == 'FWD' || best == 'BACK') {
     final longer = commands.firstWhere(
@@ -235,7 +249,7 @@ String? pickCommand(List<String> guesses) {
             c != null &&
             c != best &&
             (best == 'FWD'
-                ? (c.startsWith('FWD') || c.startsWith('HARD'))
+                ? c.startsWith('FWD')
                 : c.startsWith('BACK')),
         orElse: () => null);
     if (longer != null) return longer;
@@ -245,8 +259,15 @@ String? pickCommand(List<String> guesses) {
 
 /// Decides WHEN a heard command is sent. Speech arrives word by word, and
 /// "forward" could still become "forward left" or "forward 5 seconds".
-/// So plain FWD / BACK wait [settle] for more words (or the end of the
-/// sentence). Every other command, STOP included, is sent at once.
+///
+/// [instantDrive] true (fast): plain FWD / BACK are sent at once. If the
+/// same sentence then grows into a longer command in the same direction
+/// (FWD -> FWD_LEFT, FWD_RIGHT, FWD5;
+/// BACK -> BACK_LEFT, BACK_RIGHT, BACK5) within [upgradeWithin], that
+/// longer command is sent too and replaces it on the car.
+/// [instantDrive] false: plain FWD / BACK wait [settle] for more words (or
+/// the end of the sentence). Every other command, STOP included, is
+/// always sent at once.
 ///
 /// The mic keeps listening after a command (it is NOT stopped and
 /// restarted, which made some phones' speech service go deaf). Words that
@@ -254,13 +275,28 @@ String? pickCommand(List<String> guesses) {
 /// listening round sends FWD and then STOP.
 class VoiceCommandPicker {
   VoiceCommandPicker(this.onCommand,
-      {this.settle = const Duration(milliseconds: 800)});
+      {this.settle = const Duration(milliseconds: 800),
+      this.instantDrive = false,
+      this.upgradeWithin = const Duration(seconds: 2)});
 
   final void Function(String command) onCommand;
   final Duration settle;
+  final bool instantDrive;
+  final Duration upgradeWithin;
   Timer? _timer;
+  // instantDrive: the FWD / BACK just sent, which more words may still
+  // turn into a longer command, and where its words begin.
+  String? _upgradable;
+  int _upgradeFrom = 0;
+  Timer? _upgradeTimer;
+  // Where the words of the last sent command begin, and whether it was
+  // sent just now (then a trailing word can still belong to it).
+  int _lastFrom = 0;
+  bool _lastRecent = false;
+  Timer? _recentTimer;
   String? _waiting;
   List<String> _waitingWords = const []; // words used by the waiting command
+  int _waitingFrom = 0;
   List<String> _used = const []; // words of this round that gave a command
   String? _lastSent; // last command sent in this round
 
@@ -274,7 +310,22 @@ class VoiceCommandPicker {
     _waitingWords = const [];
     _used = const [];
     _lastSent = null;
+    _lastRecent = false;
+    _recentTimer?.cancel();
+    _endUpgrade();
   }
+
+  void _endUpgrade() {
+    _upgradeTimer?.cancel();
+    _upgradeTimer = null;
+    _upgradable = null;
+  }
+
+  static bool _isUpgrade(String from, String to) => from == 'FWD'
+      ? const ['FWD_LEFT', 'FWD_RIGHT', 'FWD5']
+          .contains(to)
+      : from == 'BACK' &&
+          const ['BACK_LEFT', 'BACK_RIGHT', 'BACK5'].contains(to);
 
   static bool _startsWith(List<String> words, List<String> prefix) {
     if (prefix.length > words.length) return false;
@@ -305,18 +356,62 @@ class VoiceCommandPicker {
       _used = best; // the old phrase reworded: nothing new
       command = null;
     }
+    // "left forward" gave FWD_LEFT and then "forward" is heard again: the
+    // word belongs to that command, it is not a new FWD command.
+    final last = _lastSent;
+    if (command != null &&
+        continues &&
+        _lastRecent &&
+        (command == 'FWD' || command == 'BACK') &&
+        last != null &&
+        last != command &&
+        !const ['STOP', 'START', 'OFF'].contains(last)) {
+      final whole = best
+          .skip(_lastFrom > best.length ? best.length : _lastFrom)
+          .join(' ');
+      if (parseVoiceCommand(whole) == last) {
+        _used = best;
+        command = null;
+      }
+    }
+    // instantDrive: "forward" was already sent and the sentence goes on
+    // ("forward" -> "forward left"): read it again from where "forward"
+    // began, and send the longer command if that is what it became.
+    final up = _upgradable;
+    if (command == null && up != null && continues) {
+      String again(String text) {
+        final w = normalizeHeardWords(text);
+        return w
+            .skip(_upgradeFrom > w.length ? w.length : _upgradeFrom)
+            .join(' ');
+      }
+
+      final longer = pickCommand([again(words), ...alternates.map(again)]);
+      if (longer != null && _isUpgrade(up, longer)) {
+        _send(longer, best, _upgradeFrom);
+        return longer;
+      }
+    }
     if (command == null) {
       if (isFinal) flush();
       return null;
     }
+    if ((command == 'FWD' || command == 'BACK') && instantDrive) {
+      _send(command, best, from);
+      _upgradable = command;
+      _upgradeFrom = from;
+      _upgradeTimer = Timer(upgradeWithin, _endUpgrade);
+      return command;
+    }
     if ((command == 'FWD' || command == 'BACK') && !isFinal) {
       _waiting = command;
       _waitingWords = best;
+      _waitingFrom = from;
       _timer?.cancel();
       _timer = Timer(settle, flush);
       return command;
     }
-    _send(command, best);
+    _send(command, best, from);
     return command;
   }
 
@@ -324,10 +419,15 @@ class VoiceCommandPicker {
   /// end of a sentence, and when you let go of the mic in push-to-talk).
   void flush() {
     final w = _waiting;
-    if (w != null) _send(w, _waitingWords);
+    if (w != null) _send(w, _waitingWords, _waitingFrom);
   }
 
-  void _send(String command, List<String> words) {
+  void _send(String command, List<String> words, int from) {
+    _endUpgrade();
+    _lastFrom = from;
+    _lastRecent = true;
+    _recentTimer?.cancel();
+    _recentTimer = Timer(upgradeWithin, () => _lastRecent = false);
     _timer?.cancel();
     _timer = null;
     _waiting = null;
@@ -336,7 +436,11 @@ class VoiceCommandPicker {
     onCommand(command);
   }
 
-  void dispose() => _timer?.cancel();
+  void dispose() {
+    _timer?.cancel();
+    _upgradeTimer?.cancel();
+    _recentTimer?.cancel();
+  }
 }
 
 enum ControlMode { voice, controller }
@@ -390,7 +494,8 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
   String _heard = ''; // live words, so you can see what the phone hears
   double _micLevel = 0; // 0..1
   DateTime _lastCommandAt = DateTime.fromMillisecondsSinceEpoch(0);
-  late final VoiceCommandPicker _picker = VoiceCommandPicker(_onVoiceCommand);
+  late final VoiceCommandPicker _picker = VoiceCommandPicker(_onVoiceCommand,
+      instantDrive: sendDriveAtOnce, settle: driveSettle);
   bool _restartScheduled = false;
   // Mic health: if the phone's speech service stops sending anything
   // (no sound level, no words, no status) the app restarts it by itself.
@@ -574,9 +679,11 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
 
   // ===================== Voice commands =====================
 
-  /// Sends a voice command. UDP has no automatic retry, so if the ESP32
-  /// doesn't answer within 150 ms we send again (up to 3 times). The
-  /// sequence number stops the car from running the same command twice.
+  /// Sends a voice command. It goes out twice straight away (a Wi-Fi
+  /// packet is sometimes lost, and a second copy is quicker than waiting
+  /// to notice that). If the ESP32 still doesn't answer within 80 ms we
+  /// send again (up to 5 times). The sequence number stops the car from
+  /// running the same command twice.
   void _sendVoiceCommand(String command) {
     _lastCommandAt = DateTime.now();
     _seq++;
@@ -588,14 +695,15 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
     _setStatus('Sending: ${_commandName(command)}...');
     final message = 'V $seq $command';
     _sendRaw(message);
+    _sendRaw(message);
 
     _retryTimer?.cancel();
-    _retryTimer = Timer.periodic(const Duration(milliseconds: 150), (timer) {
+    _retryTimer = Timer.periodic(const Duration(milliseconds: 80), (timer) {
       if (_pendingSeq != seq) {
         timer.cancel();
         return;
       }
-      if (_retries >= 3) {
+      if (_retries >= 5) {
         timer.cancel();
         _pendingSeq = null;
         _pendingCommand = null;
@@ -613,16 +721,16 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
       'START': 'Engine on',
       'OFF': 'Engine off',
       'STOP': 'Stop',
-      'FWD': 'Forward (until stop)',
-      'BACK': 'Backward (until stop)',
+      'FWD': 'Forward (short)',
+      'BACK': 'Backward (short)',
       'FWD5': 'Forward 5 seconds',
       'BACK5': 'Backward 5 seconds',
-      'FWD_LEFT': 'Forward left 3 seconds',
-      'FWD_RIGHT': 'Forward right 3 seconds',
-      'BACK_LEFT': 'Backward left 3 seconds',
-      'BACK_RIGHT': 'Backward right 3 seconds',
-      'HARD_LEFT': 'Hard left forward (circle)',
-      'HARD_RIGHT': 'Hard right forward (circle)',
+      'FWD_LEFT': 'Forward left',
+      'FWD_RIGHT': 'Forward right',
+      'BACK_LEFT': 'Backward left',
+      'BACK_RIGHT': 'Backward right',
+      'DRIFT_LEFT': 'Drift left (nose to the left)',
+      'DRIFT_RIGHT': 'Drift right (nose to the right)',
     };
     return names[command] ?? command;
   }
@@ -791,9 +899,13 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
   void _restartSoon() {
     if (!_handsFree || _restartScheduled || _resetting) return;
     _restartScheduled = true;
-    // Wait longer after errors in a row (0.3, 0.6, 1.2, 2.4 s), so a busy
-    // speech service gets time to recover instead of being hammered.
-    final wait = 300 * (1 << (_errorStreak > 3 ? 3 : _errorStreak));
+    // A normal end of a round restarts almost at once (100 ms), so words
+    // spoken right after it are not missed. After errors in a row wait
+    // longer (0.3, 0.6, 1.2, 2.4 s), so a busy speech service gets time to
+    // recover instead of being hammered.
+    final wait = _errorStreak == 0
+        ? 100
+        : 300 * (1 << (_errorStreak > 4 ? 3 : _errorStreak - 1));
     Future.delayed(Duration(milliseconds: wait), () async {
       _restartScheduled = false;
       if (mounted && !_resetting) await _startListening();
@@ -1170,7 +1282,7 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
                     'Start · Turn off · Stop\n'
                     'Forward · Backward · 5 seconds forward/backward\n'
                     'Forward left/right · Backward left/right\n'
-                    'Hard left forward · Hard right forward',
+                    'Drift left · Drift right',
                     textAlign: TextAlign.center,
                     style: TextStyle(color: Colors.black54, fontSize: 13),
                   ),
