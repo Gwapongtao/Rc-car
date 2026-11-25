@@ -43,10 +43,7 @@ void main() {
   WidgetsFlutterBinding.ensureInitialized();
   // The app starts in voice mode, which is portrait.
   SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
-  runApp(const MaterialApp(
-    debugShowCheckedModeBanner: false,
-    home: CarPage(),
-  ));
+  runApp(const MaterialApp(debugShowCheckedModeBanner: false, home: CarPage()));
 }
 
 /// Words the speech engine often hears instead of the real command word,
@@ -129,8 +126,11 @@ int _editDistance(String a, String b) {
     cur[0] = i;
     for (var j = 1; j <= b.length; j++) {
       final cost = a[i - 1] == b[j - 1] ? 0 : 1;
-      cur[j] = [prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost]
-          .reduce((x, y) => x < y ? x : y);
+      cur[j] = [
+        prev[j] + 1,
+        cur[j - 1] + 1,
+        prev[j - 1] + cost,
+      ].reduce((x, y) => x < y ? x : y);
     }
     prev = cur;
   }
@@ -197,7 +197,7 @@ String? parseVoiceCommand(String sentence) {
     'switch off',
     'shut down',
     'shutdown',
-    'turnoff'
+    'turnoff',
   ])) {
     return 'OFF';
   }
@@ -245,13 +245,12 @@ String? pickCommand(List<String> guesses) {
   // same direction, use that one.
   if (best == 'FWD' || best == 'BACK') {
     final longer = commands.firstWhere(
-        (c) =>
-            c != null &&
-            c != best &&
-            (best == 'FWD'
-                ? c.startsWith('FWD')
-                : c.startsWith('BACK')),
-        orElse: () => null);
+      (c) =>
+          c != null &&
+          c != best &&
+          (best == 'FWD' ? c.startsWith('FWD') : c.startsWith('BACK')),
+      orElse: () => null,
+    );
     if (longer != null) return longer;
   }
   return best;
@@ -273,11 +272,17 @@ String? pickCommand(List<String> guesses) {
 /// restarted, which made some phones' speech service go deaf). Words that
 /// already gave a command are skipped, so "forward ... stop" in one
 /// listening round sends FWD and then STOP.
+/// The longest command ("five seconds forward", "backward left") plus a
+/// spare word.
+const int maxCommandWords = 5;
+
 class VoiceCommandPicker {
-  VoiceCommandPicker(this.onCommand,
-      {this.settle = const Duration(milliseconds: 800),
-      this.instantDrive = false,
-      this.upgradeWithin = const Duration(seconds: 2)});
+  VoiceCommandPicker(
+    this.onCommand, {
+    this.settle = const Duration(milliseconds: 800),
+    this.instantDrive = false,
+    this.upgradeWithin = const Duration(seconds: 2),
+  });
 
   final void Function(String command) onCommand;
   final Duration settle;
@@ -289,14 +294,8 @@ class VoiceCommandPicker {
   String? _upgradable;
   int _upgradeFrom = 0;
   Timer? _upgradeTimer;
-  // Where the words of the last sent command begin, and whether it was
-  // sent just now (then a trailing word can still belong to it).
-  int _lastFrom = 0;
-  bool _lastRecent = false;
-  Timer? _recentTimer;
   String? _waiting;
   List<String> _waitingWords = const []; // words used by the waiting command
-  int _waitingFrom = 0;
   List<String> _used = const []; // words of this round that gave a command
   String? _lastSent; // last command sent in this round
 
@@ -310,8 +309,6 @@ class VoiceCommandPicker {
     _waitingWords = const [];
     _used = const [];
     _lastSent = null;
-    _lastRecent = false;
-    _recentTimer?.cancel();
     _endUpgrade();
   }
 
@@ -322,8 +319,7 @@ class VoiceCommandPicker {
   }
 
   static bool _isUpgrade(String from, String to) => from == 'FWD'
-      ? const ['FWD_LEFT', 'FWD_RIGHT', 'FWD5']
-          .contains(to)
+      ? const ['FWD_LEFT', 'FWD_RIGHT', 'FWD5'].contains(to)
       : from == 'BACK' &&
           const ['BACK_LEFT', 'BACK_RIGHT', 'BACK5'].contains(to);
 
@@ -336,8 +332,11 @@ class VoiceCommandPicker {
   }
 
   /// Returns the command it understood (sent or waiting), or null.
-  String? hear(String words,
-      {required bool isFinal, List<String> alternates = const []}) {
+  String? hear(
+    String words, {
+    required bool isFinal,
+    List<String> alternates = const [],
+  }) {
     final best = normalizeHeardWords(words);
     // The mic stays open after a command, so more words come in the same
     // round. If the text still begins with the words that gave the last
@@ -345,34 +344,28 @@ class VoiceCommandPicker {
     // started a new phrase (or reworded the old one): read all of it, but
     // never send the same command twice for one phrase.
     final continues = _startsWith(best, _used);
-    final from = continues ? _used.length : 0;
+    // The phone sometimes re-writes earlier words of a long round
+    // ("forward stop" -> "ford stop backward"). If the text got LONGER,
+    // the new words are still at the end: read only those. Reading all of
+    // it again made an old "stop" win over every new command, so after a
+    // few commands the mic seemed deaf until the round ended.
+    final from = continues || best.length > _used.length ? _used.length : 0;
     String fresh(String text) {
       final w = normalizeHeardWords(text);
-      return w.skip(from > w.length ? w.length : from).join(' ');
+      final rest = w.skip(from > w.length ? w.length : from).toList();
+      // A command is at most 4 words. Only the latest few words count, so
+      // old chatter in a long round can't mix with a new command.
+      return rest
+          .skip(
+            rest.length > maxCommandWords ? rest.length - maxCommandWords : 0,
+          )
+          .join(' ');
     }
 
     var command = pickCommand([fresh(words), ...alternates.map(fresh)]);
     if (!continues && command != null && command == _lastSent) {
       _used = best; // the old phrase reworded: nothing new
       command = null;
-    }
-    // "left forward" gave FWD_LEFT and then "forward" is heard again: the
-    // word belongs to that command, it is not a new FWD command.
-    final last = _lastSent;
-    if (command != null &&
-        continues &&
-        _lastRecent &&
-        (command == 'FWD' || command == 'BACK') &&
-        last != null &&
-        last != command &&
-        !const ['STOP', 'START', 'OFF'].contains(last)) {
-      final whole = best
-          .skip(_lastFrom > best.length ? best.length : _lastFrom)
-          .join(' ');
-      if (parseVoiceCommand(whole) == last) {
-        _used = best;
-        command = null;
-      }
     }
     // instantDrive: "forward" was already sent and the sentence goes on
     // ("forward" -> "forward left"): read it again from where "forward"
@@ -388,7 +381,7 @@ class VoiceCommandPicker {
 
       final longer = pickCommand([again(words), ...alternates.map(again)]);
       if (longer != null && _isUpgrade(up, longer)) {
-        _send(longer, best, _upgradeFrom);
+        _send(longer, best);
         return longer;
       }
     }
@@ -397,7 +390,7 @@ class VoiceCommandPicker {
       return null;
     }
     if ((command == 'FWD' || command == 'BACK') && instantDrive) {
-      _send(command, best, from);
+      _send(command, best);
       _upgradable = command;
       _upgradeFrom = from;
       _upgradeTimer = Timer(upgradeWithin, _endUpgrade);
@@ -406,12 +399,11 @@ class VoiceCommandPicker {
     if ((command == 'FWD' || command == 'BACK') && !isFinal) {
       _waiting = command;
       _waitingWords = best;
-      _waitingFrom = from;
       _timer?.cancel();
       _timer = Timer(settle, flush);
       return command;
     }
-    _send(command, best, from);
+    _send(command, best);
     return command;
   }
 
@@ -419,15 +411,11 @@ class VoiceCommandPicker {
   /// end of a sentence, and when you let go of the mic in push-to-talk).
   void flush() {
     final w = _waiting;
-    if (w != null) _send(w, _waitingWords, _waitingFrom);
+    if (w != null) _send(w, _waitingWords);
   }
 
-  void _send(String command, List<String> words, int from) {
+  void _send(String command, List<String> words) {
     _endUpgrade();
-    _lastFrom = from;
-    _lastRecent = true;
-    _recentTimer?.cancel();
-    _recentTimer = Timer(upgradeWithin, () => _lastRecent = false);
     _timer?.cancel();
     _timer = null;
     _waiting = null;
@@ -439,8 +427,58 @@ class VoiceCommandPicker {
   void dispose() {
     _timer?.cancel();
     _upgradeTimer?.cancel();
-    _recentTimer?.cancel();
   }
+}
+
+/// Decides how soon the mic listens again after a listening round ends,
+/// and when the phone's speech service is stuck and must be rebuilt.
+///
+/// In hands-free mode Android ends a round every few seconds when nobody
+/// speaks, with "error_speech_timeout" or "error_no_match". That is
+/// NORMAL and must not count as a failure. (The older app counted it: after
+/// a few quiet minutes it waited up to 2.4 s between rounds and rebuilt the
+/// speech service every ~5 rounds, about 1 s deaf each time. That was the
+/// "slow / not hearing after a while" bug.)
+class MicRestartPolicy {
+  /// A quiet round shorter than this is not normal: the service failed
+  /// at once, so it counts as a failure.
+  static const Duration quickFail = Duration(milliseconds: 1500);
+
+  /// Wait before the next round when everything is fine. Not lower: some
+  /// phones answer "error_busy" if a new round starts too soon.
+  static const int normalWaitMs = 250;
+  static const int rebuildAfter = 5; // failures in a row
+
+  int failures = 0;
+  DateTime? _roundStartedAt;
+
+  void roundStarted(DateTime now) => _roundStartedAt = now;
+
+  /// Words came in: the service works.
+  void heard() => failures = 0;
+
+  void rebuilt() {
+    failures = 0;
+    _roundStartedAt = null;
+  }
+
+  static const quietEnds = ['error_no_match', 'error_speech_timeout'];
+
+  /// Call for every error. Returns true when the error is a real failure.
+  bool error(String msg, DateTime now) {
+    final started = _roundStartedAt;
+    final quick = started == null || now.difference(started) < quickFail;
+    final real = !quietEnds.contains(msg) || quick;
+    if (real) failures++;
+    return real;
+  }
+
+  bool get needsRebuild => failures >= rebuildAfter;
+
+  /// Milliseconds to wait before the next round.
+  int waitMs() => failures == 0
+      ? normalWaitMs
+      : 300 * (1 << (failures > 4 ? 3 : failures - 1)); // 0.3 .. 2.4 s
 }
 
 enum ControlMode { voice, controller }
@@ -494,14 +532,19 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
   String _heard = ''; // live words, so you can see what the phone hears
   double _micLevel = 0; // 0..1
   DateTime _lastCommandAt = DateTime.fromMillisecondsSinceEpoch(0);
-  late final VoiceCommandPicker _picker = VoiceCommandPicker(_onVoiceCommand,
-      instantDrive: sendDriveAtOnce, settle: driveSettle);
+  late final VoiceCommandPicker _picker = VoiceCommandPicker(
+    _onVoiceCommand,
+    instantDrive: sendDriveAtOnce,
+    settle: driveSettle,
+  );
   bool _restartScheduled = false;
   // Mic health: if the phone's speech service stops sending anything
   // (no sound level, no words, no status) the app restarts it by itself.
   int _silentTicks = 0; // watchdog seconds with no sound or words
   Timer? _micWatchdog;
-  int _errorStreak = 0; // errors in a row, makes restarts wait longer
+  final MicRestartPolicy _micPolicy = MicRestartPolicy();
+  DateTime _lastCancelAt = DateTime.fromMillisecondsSinceEpoch(0);
+  int _stalledTicks = 0; // watchdog seconds with hands-free on but no round
   bool _resetting = false;
   String _status = 'Starting...';
 
@@ -603,9 +646,11 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
         _retryTimer?.cancel();
         _pendingSeq = null;
         _pendingCommand = null;
-        _setStatus(blocked
-            ? 'The engine is off. Say "start" first.'
-            : '${_commandName(command)}  (${_sendWatch.elapsedMilliseconds} ms)');
+        _setStatus(
+          blocked
+              ? 'The engine is off. Say "start" first.'
+              : '${_commandName(command)}  (${_sendWatch.elapsedMilliseconds} ms)',
+        );
       }
     }
   }
@@ -634,8 +679,10 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
     final silentFor = now.difference(_lastReplyAt);
     if (_connected && silentFor > const Duration(seconds: 1)) {
       _connected = false;
-      _setStatus('Connection lost. The car stopped by itself.\n'
-          'Is the phone on the Wi-Fi "$esp32WifiName"?');
+      _setStatus(
+        'Connection lost. The car stopped by itself.\n'
+        'Is the phone on the Wi-Fi "$esp32WifiName"?',
+      );
     }
     // Not connected: make a fresh socket every 2 s in case the phone
     // just joined the ESP32 Wi-Fi.
@@ -643,8 +690,10 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
         now.difference(_lastSocketReset) > const Duration(seconds: 2)) {
       _resetSocket();
       if (_pendingCommand == null) {
-        _setStatus('Looking for the car...\n'
-            'Connect this phone to the Wi-Fi "$esp32WifiName".');
+        _setStatus(
+          'Looking for the car...\n'
+          'Connect this phone to the Wi-Fi "$esp32WifiName".',
+        );
       }
     }
   }
@@ -707,8 +756,10 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
         timer.cancel();
         _pendingSeq = null;
         _pendingCommand = null;
-        _setStatus('The car did not answer.\n'
-            'Is the phone on the Wi-Fi "$esp32WifiName"?');
+        _setStatus(
+          'The car did not answer.\n'
+          'Is the phone on the Wi-Fi "$esp32WifiName"?',
+        );
         return;
       }
       _retries++;
@@ -746,8 +797,10 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
       _speechReady = await _tryInit([SpeechToText.androidIntentLookup]);
     }
     if (!_speechReady) {
-      _setStatus('No speech recognition service on this phone.\n'
-          'Install "Speech Recognition & Synthesis from Google" (see guide).');
+      _setStatus(
+        'No speech recognition service on this phone.\n'
+        'Install "Speech Recognition & Synthesis from Google" (see guide).',
+      );
       return;
     }
     await _pickLocale();
@@ -773,11 +826,13 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
       String norm(String id) => id.replaceAll('-', '_').toLowerCase();
       final ids = locales.map((l) => l.localeId).toList();
       String? pick = ids.cast<String?>().firstWhere(
-          (id) => norm(id!) == norm(preferredSpeechLocale),
-          orElse: () => null);
-      pick ??= ids
-          .cast<String?>()
-          .firstWhere((id) => norm(id!).startsWith('en'), orElse: () => null);
+            (id) => norm(id!) == norm(preferredSpeechLocale),
+            orElse: () => null,
+          );
+      pick ??= ids.cast<String?>().firstWhere(
+            (id) => norm(id!).startsWith('en'),
+            orElse: () => null,
+          );
       if (pick == null && ids.isNotEmpty) {
         final system = await _speech.systemLocale();
         _localeId = system?.localeId;
@@ -810,8 +865,10 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
       if (!_speechReady) return false;
     }
     if (!_connected) {
-      _setStatus('Not connected to the car yet.\n'
-          'Connect this phone to the Wi-Fi "$esp32WifiName".');
+      _setStatus(
+        'Not connected to the car yet.\n'
+        'Connect this phone to the Wi-Fi "$esp32WifiName".',
+      );
       return false;
     }
     return true;
@@ -826,7 +883,7 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
     }
     if (!await _speechCanStart()) return;
     setState(() => _handsFree = true);
-    _errorStreak = 0;
+    _micPolicy.rebuilt();
     _startWatchdog();
     await _startListening();
   }
@@ -848,6 +905,11 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
     Future.delayed(const Duration(milliseconds: 800), _picker.flush);
   }
 
+  Future<void> _cancelSpeech() {
+    _lastCancelAt = DateTime.now();
+    return _speech.cancel();
+  }
+
   Future<void> _stopListening() async {
     _micWatchdog?.cancel();
     _micWatchdog = null;
@@ -855,7 +917,7 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
     _pushToTalk = false;
     _heard = '';
     _micLevel = 0;
-    await _speech.cancel();
+    await _cancelSpeech();
     if (mounted) setState(() {});
   }
 
@@ -864,14 +926,17 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
     if (!wanted || _mode != ControlMode.voice) return;
     // The previous round may still be closing: end it first, so a new
     // round (or a quick second hold of the mic) always starts listening.
-    if (_speech.isListening) await _speech.cancel();
+    if (_speech.isListening) await _cancelSpeech();
     _picker.newRound();
+    _micPolicy.roundStarted(DateTime.now());
+    _silentTicks = 0;
     // Keep showing the last command for a moment instead of "Listening".
     final recent =
         DateTime.now().difference(_lastCommandAt) < const Duration(seconds: 3);
     if (_pendingCommand == null && !recent) {
       _setStatus(
-          _pushToTalk ? 'Listening... let go when done.' : 'Listening...');
+        _pushToTalk ? 'Listening... let go when done.' : 'Listening...',
+      );
     }
     try {
       await _speech.listen(
@@ -899,13 +964,10 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
   void _restartSoon() {
     if (!_handsFree || _restartScheduled || _resetting) return;
     _restartScheduled = true;
-    // A normal end of a round restarts almost at once (100 ms), so words
-    // spoken right after it are not missed. After errors in a row wait
-    // longer (0.3, 0.6, 1.2, 2.4 s), so a busy speech service gets time to
-    // recover instead of being hammered.
-    final wait = _errorStreak == 0
-        ? 100
-        : 300 * (1 << (_errorStreak > 4 ? 3 : _errorStreak - 1));
+    // A normal end of a round (also a quiet one) restarts in 0.25 s. Only
+    // real failures in a row wait longer (0.3, 0.6, 1.2, 2.4 s), so a busy
+    // speech service gets time to recover instead of being hammered.
+    final wait = _micPolicy.waitMs();
     Future.delayed(Duration(milliseconds: wait), () async {
       _restartScheduled = false;
       if (mounted && !_resetting) await _startListening();
@@ -917,7 +979,22 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
     _micWatchdog?.cancel();
     _silentTicks = 0;
     _micWatchdog = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (!_handsFree || _resetting || _restartScheduled) return;
+      if (!_handsFree || _resetting || _restartScheduled) {
+        _stalledTicks = 0;
+        return;
+      }
+      if (!_speech.isListening) {
+        // Between rounds: not deaf, but make sure a new round really
+        // starts (a lost "done" status must not leave the mic off).
+        _silentTicks = 0;
+        if (++_stalledTicks >= 3) {
+          _stalledTicks = 0;
+          _startListening();
+        }
+        return;
+      }
+      _stalledTicks = 0;
+      // Says "listening" but sends no sound and no words: deaf.
       _silentTicks++;
       if (_silentTicks > 4) _resetMic(auto: true);
     });
@@ -934,12 +1011,14 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
         _heard = '';
       });
     }
-    _setStatus(auto
-        ? 'The mic stopped responding. Restarting it...'
-        : 'Restarting the mic...');
+    _setStatus(
+      auto
+          ? 'The mic stopped responding. Restarting it...'
+          : 'Restarting the mic...',
+    );
     _picker.newRound();
     try {
-      await _speech.cancel();
+      await _cancelSpeech();
       await Future.delayed(const Duration(milliseconds: 400));
       // Android only builds a NEW recogniser when the engine setting
       // changes, so start and cancel once with the other setting. The next
@@ -955,13 +1034,13 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
         ),
       );
       await Future.delayed(const Duration(milliseconds: 150));
-      await _speech.cancel();
+      await _cancelSpeech();
     } catch (_) {
       // nothing to do, the normal listen below tries again
     }
     await Future.delayed(const Duration(milliseconds: 400));
     _resetting = false;
-    _errorStreak = 0;
+    _micPolicy.rebuilt();
     _restartScheduled = false;
     _silentTicks = 0;
     if (!mounted) return;
@@ -986,7 +1065,7 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
   void _onSpeechResult(SpeechRecognitionResult result) {
     if (_resetting) return;
     _silentTicks = 0;
-    _errorStreak = 0;
+    _micPolicy.heard();
     if (mounted) setState(() => _heard = result.recognizedWords);
     // Check EVERY partial result and all of the engine's guesses, so most
     // commands are sent as soon as the words are recognised.
@@ -999,8 +1078,10 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
     if (command == null &&
         result.finalResult &&
         result.recognizedWords.isNotEmpty) {
-      _setStatus('Heard: "${result.recognizedWords}"\n'
-          'Not a command. Try again, a bit slower.');
+      _setStatus(
+        'Heard: "${result.recognizedWords}"\n'
+        'Not a command. Try again, a bit slower.',
+      );
     }
   }
 
@@ -1025,30 +1106,39 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
   void _onSpeechError(SpeechRecognitionError error) {
     if (_resetting) return;
     final msg = error.errorMsg;
-    _errorStreak++;
+    final now = DateTime.now();
+    // "error_client" right after the app itself cancelled a round is just
+    // the echo of that cancel, not a problem.
+    if (msg == 'error_client' &&
+        now.difference(_lastCancelAt) < const Duration(milliseconds: 500)) {
+      return;
+    }
+    _micPolicy.error(msg, now);
     // Normal in hands-free mode: nobody spoke, or nothing matched.
     const harmless = [
       'error_no_match',
       'error_speech_timeout',
       'error_busy',
-      'error_client'
+      'error_client',
     ];
     const noOffline = [
       'error_language_unavailable',
-      'error_language_not_supported'
+      'error_language_not_supported',
     ];
     const noOnline = [
       'error_network',
       'error_network_timeout',
       'error_server',
       'error_server_disconnected',
-      'error_too_many_requests'
+      'error_too_many_requests',
     ];
 
     if (msg == 'error_permission' || msg == 'error_audio_error') {
       _stopListening();
-      _setStatus('The app can\'t use the microphone.\n'
-          'Allow "Microphone" for this app in the phone settings.');
+      _setStatus(
+        'The app can\'t use the microphone.\n'
+        'Allow "Microphone" for this app in the phone settings.',
+      );
       return;
     }
     // Switch between offline and online by itself (at most twice, so it
@@ -1058,15 +1148,18 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
             (!_onDevice && noOnline.contains(msg)))) {
       _engineSwitches++;
       _onDevice = !_onDevice;
-      _setStatus(_onDevice
-          ? 'Online speech failed. Switched to offline.'
-          : 'Offline English isn\'t installed. Switched to online speech.');
+      _setStatus(
+        _onDevice
+            ? 'Online speech failed. Switched to offline.'
+            : 'Offline English isn\'t installed. Switched to online speech.',
+      );
     } else if (!harmless.contains(msg)) {
       _setStatus(
-          'Speech problem: $msg\nSee "Voice not recognised" in the guide.');
+        'Speech problem: $msg\nSee "Voice not recognised" in the guide.',
+      );
     }
     // Many errors in a row: the recogniser is stuck, rebuild it.
-    if (_handsFree && _errorStreak >= 5) {
+    if (_handsFree && _micPolicy.needsRebuild) {
       _resetMic(auto: true);
       return;
     }
@@ -1099,9 +1192,11 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
 
   /// Controller = landscape (like a game controller), voice = portrait.
   void _setOrientation(ControlMode mode) {
-    SystemChrome.setPreferredOrientations(mode == ControlMode.controller
-        ? [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]
-        : [DeviceOrientation.portraitUp]);
+    SystemChrome.setPreferredOrientations(
+      mode == ControlMode.controller
+          ? [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]
+          : [DeviceOrientation.portraitUp],
+    );
   }
 
   // ===================== UI =====================
@@ -1134,8 +1229,10 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
 
   void _onEngineTap() {
     if (!_connected) {
-      _setStatus('Not connected to the car yet.\n'
-          'Connect this phone to the Wi-Fi "$esp32WifiName".');
+      _setStatus(
+        'Not connected to the car yet.\n'
+        'Connect this phone to the Wi-Fi "$esp32WifiName".',
+      );
       return;
     }
     _holdForward = _holdBackward = _holdLeft = _holdRight = false;
@@ -1147,22 +1244,29 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
   Widget _topBar() {
     return Row(
       children: [
-        Icon(Icons.circle,
-            size: 14, color: _connected ? Colors.green : Colors.redAccent),
+        Icon(
+          Icons.circle,
+          size: 14,
+          color: _connected ? Colors.green : Colors.redAccent,
+        ),
         const SizedBox(width: 6),
         Expanded(
-          child: Text(_connected ? _prettyState() : 'Not connected',
-              key: const Key('car_state'),
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 13)),
+          child: Text(
+            _connected ? _prettyState() : 'Not connected',
+            key: const Key('car_state'),
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 13),
+          ),
         ),
         // Engine on/off. You can also say "start" or "turn off".
         IconButton(
           key: const Key('engine_button'),
           tooltip: _engineOn ? 'Engine off' : 'Start engine',
           onPressed: _onEngineTap,
-          icon: Icon(Icons.power_settings_new,
-              color: _engineOn ? Colors.green : Colors.grey),
+          icon: Icon(
+            Icons.power_settings_new,
+            color: _engineOn ? Colors.green : Colors.grey,
+          ),
         ),
         const SizedBox(width: 4),
         SegmentedButton<ControlMode>(
@@ -1170,7 +1274,9 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
           segments: const [
             ButtonSegment(value: ControlMode.voice, icon: Icon(Icons.mic)),
             ButtonSegment(
-                value: ControlMode.controller, icon: Icon(Icons.gamepad)),
+              value: ControlMode.controller,
+              icon: Icon(Icons.gamepad),
+            ),
           ],
           selected: {_mode},
           onSelectionChanged: (s) => _switchMode(s.first),
@@ -1196,18 +1302,20 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(16),
-          child: OrientationBuilder(builder: (context, orientation) {
-            // For a moment while the phone rotates, the screen still has
-            // the old shape. Show nothing then, instead of a squashed layout.
-            final landscape = orientation == Orientation.landscape;
-            if (_mode == ControlMode.voice && !landscape) {
-              return _buildVoiceLayout();
-            }
-            if (_mode == ControlMode.controller && landscape) {
-              return _buildControllerLayout();
-            }
-            return const SizedBox.expand();
-          }),
+          child: OrientationBuilder(
+            builder: (context, orientation) {
+              // For a moment while the phone rotates, the screen still has
+              // the old shape. Show nothing then, instead of a squashed layout.
+              final landscape = orientation == Orientation.landscape;
+              if (_mode == ControlMode.voice && !landscape) {
+                return _buildVoiceLayout();
+              }
+              if (_mode == ControlMode.controller && landscape) {
+                return _buildControllerLayout();
+              }
+              return const SizedBox.expand();
+            },
+          ),
         ),
       ),
     );
@@ -1274,8 +1382,9 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
-                        color: _heard.isEmpty ? Colors.grey : Colors.black87,
-                        fontSize: 14),
+                      color: _heard.isEmpty ? Colors.grey : Colors.black87,
+                      fontSize: 14,
+                    ),
                   ),
                   const SizedBox(height: 12),
                   const Text(
@@ -1287,9 +1396,11 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
                     style: TextStyle(color: Colors.black54, fontSize: 13),
                   ),
                   const SizedBox(height: 6),
-                  Text(_speechInfo(),
-                      key: const Key('speech_info'),
-                      style: const TextStyle(color: Colors.grey, fontSize: 11)),
+                  Text(
+                    _speechInfo(),
+                    key: const Key('speech_info'),
+                    style: const TextStyle(color: Colors.grey, fontSize: 11),
+                  ),
                   TextButton.icon(
                     key: const Key('reset_mic'),
                     onPressed: _resetting ? null : () => _resetMic(auto: false),
@@ -1350,8 +1461,9 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
                       const Padding(
                         padding: EdgeInsets.only(bottom: 12),
                         child: Text(
-                            'Engine off. Tap the power button to start.',
-                            style: TextStyle(color: Colors.grey)),
+                          'Engine off. Tap the power button to start.',
+                          style: TextStyle(color: Colors.grey),
+                        ),
                       ),
                     SizedBox(
                       height: 56,
@@ -1360,13 +1472,13 @@ class _CarPageState extends State<CarPage> with WidgetsBindingObserver {
                         showSelectedIcon: false,
                         segments: const [
                           ButtonSegment(
-                              value: 0,
-                              label:
-                                  Text('Slow', style: TextStyle(fontSize: 20))),
+                            value: 0,
+                            label: Text('Slow', style: TextStyle(fontSize: 20)),
+                          ),
                           ButtonSegment(
-                              value: 1,
-                              label:
-                                  Text('Fast', style: TextStyle(fontSize: 20))),
+                            value: 1,
+                            label: Text('Fast', style: TextStyle(fontSize: 20)),
+                          ),
                         ],
                         selected: {_manualSpeed},
                         onSelectionChanged: (s) {
@@ -1458,13 +1570,15 @@ class _HoldButtonState extends State<HoldButton> {
                   : Colors.blue.shade50,
           borderRadius: BorderRadius.circular(20),
         ),
-        child: Icon(widget.icon,
-            size: 48,
-            color: !widget.enabled
-                ? Colors.grey
-                : widget.pressed
-                    ? Colors.white
-                    : Colors.blue),
+        child: Icon(
+          widget.icon,
+          size: 48,
+          color: !widget.enabled
+              ? Colors.grey
+              : widget.pressed
+                  ? Colors.white
+                  : Colors.blue,
+        ),
       ),
     );
   }
